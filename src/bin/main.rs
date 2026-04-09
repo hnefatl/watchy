@@ -7,8 +7,19 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
-use esp_hal::clock::CpuClock;
+use core::cell::RefCell;
+
+use embedded_graphics::mono_font::MonoTextStyle;
+use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_10X20};
+use embedded_graphics::prelude::*;
+use embedded_graphics::text::Text;
+use embedded_hal_bus::spi::RefCellDevice;
+use epd_waveshare::epd1in54_v2::{Display1in54, Epd1in54};
+use epd_waveshare::prelude::*;
+use esp_hal::gpio::{Input, InputConfig, Level, OutputConfig, Pull};
+use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
+use esp_hal::{clock::CpuClock, gpio::Output};
 
 use defmt::info;
 use esp_println as _;
@@ -39,6 +50,57 @@ async fn main(spawner: Spawner) -> ! {
     esp_rtos::start(timg0.timer0);
 
     info!("Embassy initialized!");
+
+    let pin_spi_edp_cs = Output::new(peripherals.GPIO33, Level::High, OutputConfig::default());
+    let pin_edp_dc = Output::new(peripherals.GPIO34, Level::Low, OutputConfig::default());
+    let pin_edp_reset = Output::new(peripherals.GPIO35, Level::Low, OutputConfig::default());
+    let pin_edp_busy = Input::new(
+        peripherals.GPIO36,
+        InputConfig::default().with_pull(Pull::Up),
+    );
+
+    let spi = esp_hal::spi::master::Spi::new(
+        peripherals.SPI2,
+        esp_hal::spi::master::Config::default()
+            .with_frequency(Rate::from_mhz(2))
+            .with_mode(esp_hal::spi::Mode::_0),
+    )
+    .unwrap()
+    .into_async()
+    .with_sck(peripherals.GPIO47)
+    .with_miso(peripherals.GPIO46)
+    .with_mosi(peripherals.GPIO48);
+
+    let r = RefCell::new(spi);
+    let mut delay = embassy_time::Delay;
+    let mut spi_device =
+        RefCellDevice::new(&r, pin_spi_edp_cs, &mut delay).expect("failed to init SPI device");
+
+    info!("SPI device initialised");
+
+    let mut epd = Epd1in54::new(
+        &mut spi_device,
+        pin_edp_busy,
+        pin_edp_dc,
+        pin_edp_reset,
+        &mut embassy_time::Delay,
+        Some(1_000), // 1ms
+    )
+    .unwrap();
+    let mut display = Display1in54::default();
+
+    info!("Start epd draw");
+    display.clear(Color::White);
+    epd.set_background_color(Color::White);
+    let style = MonoTextStyle::new(&FONT_10X20, Color::Black);
+    let _ = Text::new("foo", Point::new(10, 10), style).draw(&mut display);
+    epd.update_and_display_frame(&mut spi_device, &display.buffer(), &mut embassy_time::Delay)
+        .unwrap();
+    epd.wait_until_idle(&mut spi_device, &mut embassy_time::Delay)
+        .unwrap();
+    epd.sleep(&mut spi_device, &mut embassy_time::Delay)
+        .unwrap();
+    info!("Finish epd draw");
 
     //let radio_init = esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller");
     //let (mut _wifi_controller, _interfaces) =

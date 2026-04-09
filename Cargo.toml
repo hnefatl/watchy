@@ -59,7 +59,9 @@ smoltcp = { version = "0.12.0", default-features = false, features = [
   "socket-tcp",
   "socket-udp",
 ] }
-
+epd-waveshare = "0.6.0"
+embedded-hal-bus = "0.3.0"
+embedded-graphics = "0.8.2"
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
 
