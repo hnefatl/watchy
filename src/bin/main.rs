@@ -8,9 +8,10 @@
 #![deny(clippy::large_stack_frames)]
 
 use core::cell::RefCell;
+use core::fmt::Write;
 
 use embedded_graphics::mono_font::MonoTextStyle;
-use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_10X20};
+use embedded_graphics::mono_font::ascii::FONT_10X20;
 use embedded_graphics::prelude::*;
 use embedded_graphics::text::Text;
 use embedded_hal_bus::spi::RefCellDevice;
@@ -25,7 +26,7 @@ use defmt::info;
 use esp_println as _;
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant};
 
 use esp_backtrace as _;
 
@@ -89,19 +90,6 @@ async fn main(spawner: Spawner) -> ! {
     .unwrap();
     let mut display = Display1in54::default();
 
-    info!("Start epd draw");
-    display.clear(Color::White);
-    epd.set_background_color(Color::White);
-    let style = MonoTextStyle::new(&FONT_10X20, Color::Black);
-    let _ = Text::new("foo", Point::new(10, 10), style).draw(&mut display);
-    epd.update_and_display_frame(&mut spi_device, &display.buffer(), &mut embassy_time::Delay)
-        .unwrap();
-    epd.wait_until_idle(&mut spi_device, &mut embassy_time::Delay)
-        .unwrap();
-    epd.sleep(&mut spi_device, &mut embassy_time::Delay)
-        .unwrap();
-    info!("Finish epd draw");
-
     //let radio_init = esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller");
     //let (mut _wifi_controller, _interfaces) =
     //    esp_radio::wifi::new(&radio_init, peripherals.WIFI, Default::default())
@@ -110,8 +98,43 @@ async fn main(spawner: Spawner) -> ! {
     // TODO: Spawn some tasks
     let _ = spawner;
 
+    display.clear(Color::White);
+    epd.set_background_color(Color::White);
+    let style = MonoTextStyle::new(&FONT_10X20, Color::Black);
+
+    let mut lut_loop = [Some(RefreshLut::Full), Some(RefreshLut::Quick), None, None]
+        .iter()
+        .cycle();
+
+    let mut ticker = embassy_time::Ticker::every(Duration::from_secs(10));
     loop {
-        info!("Hello world!");
-        Timer::after(Duration::from_secs(1)).await;
+        let now_secs = Instant::now().as_secs();
+        let mut s = heapless::String::<20>::new();
+        let _ = write!(
+            s,
+            "{:02}:{:02}:{:02}",
+            now_secs / 3600 % 24,
+            now_secs / 60 % 60,
+            now_secs % 60
+        );
+        info!("Time since boot: {}", &s);
+        let text = Text::new(&s, Point::new(40, 40), style);
+
+        display.clear(Color::White);
+        text.draw(&mut display).unwrap();
+        epd.wake_up(&mut spi_device, &mut embassy_time::Delay)
+            .unwrap();
+        if let Some(lut) = lut_loop.next().unwrap() {
+            epd.set_lut(&mut spi_device, &mut embassy_time::Delay, Some(*lut))
+                .unwrap();
+        }
+        epd.update_and_display_frame(&mut spi_device, &display.buffer(), &mut embassy_time::Delay)
+            .unwrap();
+        epd.wait_until_idle(&mut spi_device, &mut embassy_time::Delay)
+            .unwrap();
+        epd.sleep(&mut spi_device, &mut embassy_time::Delay)
+            .unwrap();
+
+        ticker.next().await;
     }
 }
