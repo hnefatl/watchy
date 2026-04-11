@@ -6,7 +6,6 @@ version = "0.1.0"
 
 [[bin]]
 name = "watchy"
-path = "./src/bin/main.rs"
 
 [dependencies]
 esp-hal = { version = "~1.0", features = ["defmt", "esp32s3", "unstable"] }
@@ -38,6 +37,7 @@ esp-println = { version = "0.16.1", features = ["defmt-espflash", "esp32s3"] }
 # for more networking protocol support see https://crates.io/crates/edge-net
 embassy-executor = { version = "0.9.1", features = ["defmt"] }
 embassy-time = { version = "0.5.0", features = ["defmt"] }
+embassy-futures = "0.1"
 esp-radio = { version = "0.17.0", features = [
   "defmt",
   "esp-alloc",
@@ -60,11 +60,13 @@ smoltcp = { version = "0.12.0", default-features = false, features = [
   "socket-udp",
 ] }
 epd-waveshare = "0.6.0"
+embedded-hal = "1"
 embedded-hal-bus = "0.3.0"
 embedded-graphics = "0.8.2"
 critical-section = "1.2.0"
 static_cell = "2.1.1"
 heapless = "0.9"
+button-driver = { version = "0.2", features = ["esp", "embassy", "embedded_hal"] }
 
 
 [profile.dev]

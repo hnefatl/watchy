@@ -95,6 +95,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "button-driver"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6275c5efc1b0c65e7d9bcd419112bec6b2901feeaac63605fc735a0dcea83c63"
+dependencies = [
+ "embassy-time",
+ "embedded-hal 1.0.0",
+]
+
+[[package]]
 name = "bytemuck"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1823,12 +1833,15 @@ checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
 name = "watchy"
 version = "0.1.0"
 dependencies = [
+ "button-driver",
  "critical-section",
  "defmt 1.0.1",
  "embassy-executor",
+ "embassy-futures",
  "embassy-net",
  "embassy-time",
  "embedded-graphics",
+ "embedded-hal 1.0.0",
  "embedded-hal-bus",
  "embedded-io 0.7.1",
  "embedded-io-async 0.7.0",
