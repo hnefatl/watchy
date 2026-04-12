@@ -1,7 +1,7 @@
 use core::fmt::Write;
 use core::iter::{Cycle, Iterator};
 
-use defmt::info;
+use defmt::{debug, info};
 use embassy_time::{Duration, Instant};
 use embedded_graphics::mono_font::iso_8859_1::FONT_10X20;
 use embedded_graphics::mono_font::{MonoFont, MonoTextStyle};
@@ -26,6 +26,7 @@ pub enum WatchState {
 #[derive(Clone, PartialEq, Eq, Debug, defmt::Format)]
 pub struct DisplayState {
     pub watch_state: WatchState,
+    pub debug_status: heapless::String<100>,
     pub time_since_boot: Instant,
     pub time_offset: Duration,
 }
@@ -48,6 +49,9 @@ impl DisplayState {
         text.draw(display).unwrap();
         info!("Time is now: {}", s);
 
+        let text = Text::new(&self.debug_status, Point::new(10, 70), STYLE);
+        text.draw(display).unwrap();
+
         if let WatchState::ManualTimeSet {
             offset_mins: _,
             offset_hours: _,
@@ -62,6 +66,7 @@ impl Default for DisplayState {
     fn default() -> Self {
         Self {
             watch_state: WatchState::Main,
+            debug_status: heapless::String::new(),
             time_since_boot: Instant::now(),
             time_offset: Duration::from_secs(0),
         }
@@ -114,7 +119,7 @@ where
         let old_state = self.state.clone();
         update_state(&mut self.state);
         if self.state != old_state {
-            info!("New state: {}", self.state);
+            debug!("New state: {}", self.state);
             self.force_render()
         } else {
             Ok(())

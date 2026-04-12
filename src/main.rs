@@ -8,11 +8,14 @@
 #![deny(clippy::large_stack_frames)]
 
 use core::cell::RefCell;
+use core::fmt::Write;
 
-use button_driver::ButtonConfig;
-use embassy_futures::select::Either5;
+use embassy_futures::select::{Either, select};
 use embedded_hal_bus::spi::RefCellDevice;
-use esp_hal::gpio::{Input, InputConfig, Level, OutputConfig};
+use esp_hal::delay::Delay;
+use esp_hal::gpio::{Io, Level, OutputConfig, RtcFunction, RtcPin};
+use esp_hal::rtc_cntl::sleep::{RtcioWakeupSource, TimerWakeupSource, WakeupLevel};
+use esp_hal::rtc_cntl::{Rtc, reset_reason, wakeup_cause};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::{clock::CpuClock, gpio::Output};
@@ -21,13 +24,11 @@ use defmt::info;
 use esp_println as _;
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Instant};
+use embassy_time::Duration;
 
 use esp_backtrace as _;
 
 extern crate alloc;
-
-type Button = button_driver::Button<Input<'static>, Instant, Duration>;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -35,42 +36,30 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 mod display;
 use display::*;
+mod buttons;
+use buttons::*;
 
 #[allow(
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
 )]
 #[esp_rtos::main]
-async fn main(spawner: Spawner) -> ! {
+async fn main(_spawner: Spawner) -> ! {
+    info!(
+        "Reset due to: {:?} ({})",
+        defmt::Debug2Format(&reset_reason(esp_hal::system::Cpu::ProCpu)),
+        wakeup_cause(),
+    );
+
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73000);
-
     let timg0 = TimerGroup::new(peripherals.TIMG0);
+    //esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73000);
     esp_rtos::start(timg0.timer0);
-
-    info!("Embassy initialized!");
-
-    let mut button1 = Button::new(
-        Input::new(peripherals.GPIO7, InputConfig::default()),
-        ButtonConfig::default(),
-    );
-    let mut button2 = Button::new(
-        Input::new(peripherals.GPIO6, InputConfig::default()),
-        ButtonConfig::default(),
-    );
-    let mut button3 = Button::new(
-        Input::new(peripherals.GPIO0, InputConfig::default()),
-        ButtonConfig::default(),
-    );
-    let mut button4 = Button::new(
-        Input::new(peripherals.GPIO8, InputConfig::default()),
-        ButtonConfig::default(),
-    );
+    info!("Embassy initialized");
 
     let pin_spi_edp_cs = Output::new(peripherals.GPIO33, Level::High, OutputConfig::default());
-
     let spi = esp_hal::spi::master::Spi::new(
         peripherals.SPI2,
         esp_hal::spi::master::Config::default()
@@ -87,7 +76,6 @@ async fn main(spawner: Spawner) -> ! {
     let mut delay = embassy_time::Delay;
     let spi_device =
         RefCellDevice::new(&r, pin_spi_edp_cs, &mut delay).expect("failed to init SPI device");
-
     info!("SPI device initialised");
 
     let mut display = Display::new(
@@ -96,80 +84,83 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO34,
         peripherals.GPIO35,
     );
+    info!("Forced initial render");
+    display
+        .update_state(|s| {
+            s.debug_status.clear();
+            write!(s.debug_status, "{:?}", wakeup_cause()).unwrap();
+        })
+        .unwrap();
+
+    let delay = Delay::new();
+    let mut io = Io::new(peripherals.IO_MUX);
+    let button_pins = (
+        peripherals.GPIO7,
+        peripherals.GPIO6,
+        peripherals.GPIO0,
+        peripherals.GPIO8,
+    );
+    // RtcioWakeupSource configures the pins to the RTC mux: but due to a bug(?),
+    // it doesn't reset them back to the IO mux (that logic's in the drop
+    // function, which isn't called when resuming from sleep).
+    // Workaround by manually reconfiguring all the wakeup pins to digital IO.
+    button_pins.0.rtc_set_config(true, false, RtcFunction::Rtc);
+    button_pins.1.rtc_set_config(true, false, RtcFunction::Rtc);
+    button_pins.2.rtc_set_config(true, false, RtcFunction::Rtc);
+    button_pins.3.rtc_set_config(true, false, RtcFunction::Rtc);
+    let mut buttons = Buttons::init(&mut io, button_pins);
+    info!("Buttons initialized");
+
+    loop {
+        let sleep_timer = embassy_time::Timer::after_secs(60);
+        match select(sleep_timer, buttons.wait_for_event()).await {
+            Either::First(_) => {
+                info!("Inactive for 60s, going to sleep.");
+                break;
+            }
+            Either::Second((button_id, button_event)) => {
+                info!("Button press: {}", (button_id, button_event));
+                display
+                    .update_state(|s| {
+                        if button_event == ButtonEvent::Pressed {
+                            s.time_since_boot += Duration::from_secs(60);
+                        }
+                        s.debug_status.clear();
+                        let states = buttons.get_states();
+                        write!(
+                            s.debug_status,
+                            "{}\n{}\n{}\n{}",
+                            states.0, states.1, states.2, states.3
+                        )
+                        .unwrap();
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    let mut button_pins = buttons.reclaim();
+
+    let mut rtc = Rtc::new(peripherals.LPWR);
+    let button_rtc_pins: &mut [(&mut dyn RtcPin, WakeupLevel)] = &mut [
+        (&mut button_pins.0, WakeupLevel::Low),
+        (&mut button_pins.1, WakeupLevel::Low),
+        // GPIO0 is low immediately after deep sleep reset, so waiting for it to go
+        // low immediately wakes up. But because it's already low, if the button's
+        // pressed there's no change, so wakeup doesn't work for this button.
+        // TODO: fix somehow?
+        (&mut button_pins.2, WakeupLevel::High),
+        (&mut button_pins.3, WakeupLevel::Low),
+    ];
+    let buttons_wakeup = RtcioWakeupSource::new(button_rtc_pins);
+    let timer_wakeup = TimerWakeupSource::new(core::time::Duration::from_secs(10));
+
+    info!("Entering deep sleep");
+    delay.delay_millis(100);
+    rtc.sleep_deep(&[&buttons_wakeup, &timer_wakeup]);
 
     //let radio_init = esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller");
     //let (mut wifi_controller, _interfaces) =
     //    esp_radio::wifi::new(&radio_init, peripherals.WIFI, Default::default())
     //        .expect("Failed to initialize Wi-Fi controller");
-
-    // TODO: Spawn some tasks
-    let _ = spawner;
-
-    let mut ticker = embassy_time::Ticker::every(Duration::from_secs(10));
-    display.force_render().unwrap();
-    loop {
-        button1.tick();
-        button2.tick();
-        button3.tick();
-        button4.tick();
-
-        display
-            .update_state(|state: &mut DisplayState| {
-                match &mut state.watch_state {
-                    WatchState::Main => {
-                        if button1.is_clicked() {
-                            button1.reset();
-                            state.watch_state = WatchState::ManualTimeSet {
-                                offset_hours: 0,
-                                offset_mins: 0,
-                            };
-                            info!("Entered manual time set mode")
-                        }
-                    }
-                    WatchState::ManualTimeSet {
-                        offset_hours,
-                        offset_mins,
-                    } => {
-                        if button2.is_clicked() {
-                            button2.reset();
-                            *offset_hours = (*offset_hours + 1) % 24
-                        }
-                        if button3.is_clicked() {
-                            button3.reset();
-                            *offset_mins = (*offset_mins + 1) % 60
-                        }
-                        state.time_offset =
-                            Duration::from_secs(3600 * *offset_hours + 60 * *offset_mins);
-                        info!("New time offset: {}", state.time_offset);
-
-                        if button1.is_clicked() {
-                            button1.reset();
-                            // Exit
-                            state.watch_state = WatchState::Main;
-                            info!("Returned to main mode");
-                        }
-                    }
-                }
-            })
-            .unwrap();
-
-        // This is a busy polling loop, not an energy-efficient interrupt.
-        let res = embassy_futures::select::select5(
-            ticker.next(),
-            // Wait for release, not press
-            button1.pin.wait_for_any_edge(),
-            button2.pin.wait_for_any_edge(),
-            button3.pin.wait_for_any_edge(),
-            button4.pin.wait_for_any_edge(),
-        )
-        .await;
-        let cause = match res {
-            Either5::First(_) => "timer",
-            Either5::Second(_) => "button1",
-            Either5::Third(_) => "button2",
-            Either5::Fourth(_) => "button3",
-            Either5::Fifth(_) => "button4",
-        };
-        info!("Woken up by: {}", cause);
-    }
 }
