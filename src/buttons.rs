@@ -2,9 +2,9 @@ use core::cell::RefCell;
 use core::panic;
 
 use critical_section::Mutex;
-use defmt::{error, info};
+use defmt::error;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::{Channel, TrySendError};
+use embassy_sync::channel::{Channel, TryReceiveError, TrySendError};
 use esp_hal::gpio::{Event, Input, InputConfig, InputPin, Io, Pull};
 use esp_hal::handler;
 use esp_hal::peripherals::{GPIO0, GPIO6, GPIO7, GPIO8};
@@ -84,8 +84,20 @@ impl Buttons {
         )
     }
 
+    /// Wait and receive the first event.
     pub async fn wait_for_event(&mut self) -> (ButtonId, ButtonEvent) {
         CHANNEL.receive().await
+    }
+    /// Wait for an event to be ready, but don't return it.
+    pub async fn wait_for_event_ready(&self) {
+        CHANNEL.ready_to_receive().await
+    }
+    /// Fetch an event if one exists.
+    pub fn try_get_event(&mut self) -> Option<(ButtonId, ButtonEvent)> {
+        match CHANNEL.try_receive() {
+            Ok(b) => Some(b),
+            Err(TryReceiveError::Empty) => None,
+        }
     }
     pub fn get_states(&self) -> (bool, bool, bool, bool) {
         critical_section::with(|cs| {

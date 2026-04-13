@@ -11,7 +11,14 @@ use core::cell::RefCell;
 use core::fmt::Write;
 
 use embassy_futures::select::{Either, select};
+use embedded_graphics::mono_font::ascii::FONT_10X20;
+use embedded_graphics::mono_font::{MonoFont, MonoTextStyle};
+use embedded_graphics::prelude::*;
+use embedded_graphics::text::Text;
+use embedded_hal::spi::SpiDevice;
 use embedded_hal_bus::spi::RefCellDevice;
+use epd_waveshare::color::Color;
+use epd_waveshare::epd1in54::Display1in54;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Io, Level, OutputConfig, RtcFunction, RtcPin};
 use esp_hal::rtc_cntl::sleep::{RtcioWakeupSource, TimerWakeupSource, WakeupLevel};
@@ -39,6 +46,55 @@ use display::*;
 mod buttons;
 use buttons::*;
 
+const INACTIVITY_DURATION: Duration = Duration::from_secs(5);
+
+// TODO: split into separate structs for clarity.
+#[derive(Clone, Debug, PartialEq, Eq, defmt::Format)]
+pub enum MenuState {
+    None,
+    DebugView(heapless::String<100>),
+    ManualTimeSet { offset_hours: u64, offset_mins: u64 },
+}
+// TODO: add update for each struct.
+impl MenuItem for MenuState {
+    fn render(&self, display: &mut Display1in54, time_provider: &impl TimeProvider) {
+        const FONT: MonoFont = FONT_10X20;
+        const STYLE: MonoTextStyle<'_, Color> = MonoTextStyle::new(&FONT, Color::Black);
+
+        display.clear(Color::White);
+
+        let current_time = time_provider.get_current_time();
+        match &self {
+            MenuState::None => {
+                let mut s = heapless::String::<20>::new();
+                let _ = write!(
+                    s,
+                    "{:02}:{:02}:{:02}",
+                    current_time.as_secs() / 3600 % 24,
+                    current_time.as_secs() / 60 % 60,
+                    current_time.as_secs() % 60
+                );
+                let text = Text::new(&s, Point::new(40, 40), STYLE);
+                text.draw(display).unwrap();
+            }
+            MenuState::DebugView(message) => {
+                let text = Text::new(&message, Point::new(10, 10), STYLE);
+                text.draw(display).unwrap();
+            }
+            MenuState::ManualTimeSet {
+                offset_hours: _,
+                offset_mins: _,
+            } => {
+                let text = Text::new("time set mode", Point::new(35, 100), STYLE);
+                text.draw(display).unwrap();
+            }
+        }
+    }
+    fn update(&mut self, time_provider: &impl TimeProvider) {
+        unimplemented!()
+    }
+}
+
 #[allow(
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
@@ -57,6 +113,7 @@ async fn main(_spawner: Spawner) -> ! {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     //esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73000);
     esp_rtos::start(timg0.timer0);
+    let mut rtc = Rtc::new(peripherals.LPWR);
     info!("Embassy initialized");
 
     let pin_spi_edp_cs = Output::new(peripherals.GPIO33, Level::High, OutputConfig::default());
@@ -84,13 +141,6 @@ async fn main(_spawner: Spawner) -> ! {
         peripherals.GPIO34,
         peripherals.GPIO35,
     );
-    info!("Forced initial render");
-    display
-        .update_state(|s| {
-            s.debug_status.clear();
-            write!(s.debug_status, "{:?}", wakeup_cause()).unwrap();
-        })
-        .unwrap();
 
     let delay = Delay::new();
     let mut io = Io::new(peripherals.IO_MUX);
@@ -111,37 +161,10 @@ async fn main(_spawner: Spawner) -> ! {
     let mut buttons = Buttons::init(&mut io, button_pins);
     info!("Buttons initialized");
 
-    loop {
-        let sleep_timer = embassy_time::Timer::after_secs(60);
-        match select(sleep_timer, buttons.wait_for_event()).await {
-            Either::First(_) => {
-                info!("Inactive for 60s, going to sleep.");
-                break;
-            }
-            Either::Second((button_id, button_event)) => {
-                info!("Button press: {}", (button_id, button_event));
-                display
-                    .update_state(|s| {
-                        if button_event == ButtonEvent::Pressed {
-                            s.time_since_boot += Duration::from_secs(60);
-                        }
-                        s.debug_status.clear();
-                        let states = buttons.get_states();
-                        write!(
-                            s.debug_status,
-                            "{}\n{}\n{}\n{}",
-                            states.0, states.1, states.2, states.3
-                        )
-                        .unwrap();
-                    })
-                    .unwrap();
-            }
-        }
-    }
+    let mut time_provider = RtcTimeProvider::new(&rtc);
+    main_loop(&mut display, &mut buttons, &mut time_provider).await;
 
     let mut button_pins = buttons.reclaim();
-
-    let mut rtc = Rtc::new(peripherals.LPWR);
     let button_rtc_pins: &mut [(&mut dyn RtcPin, WakeupLevel)] = &mut [
         (&mut button_pins.0, WakeupLevel::Low),
         (&mut button_pins.1, WakeupLevel::Low),
@@ -153,7 +176,7 @@ async fn main(_spawner: Spawner) -> ! {
         (&mut button_pins.3, WakeupLevel::Low),
     ];
     let buttons_wakeup = RtcioWakeupSource::new(button_rtc_pins);
-    let timer_wakeup = TimerWakeupSource::new(core::time::Duration::from_secs(10));
+    let timer_wakeup = TimerWakeupSource::new(core::time::Duration::from_secs(60));
 
     info!("Entering deep sleep");
     delay.delay_millis(100);
@@ -163,4 +186,47 @@ async fn main(_spawner: Spawner) -> ! {
     //let (mut wifi_controller, _interfaces) =
     //    esp_radio::wifi::new(&radio_init, peripherals.WIFI, Default::default())
     //        .expect("Failed to initialize Wi-Fi controller");
+}
+
+async fn main_loop<SPI>(
+    display: &mut Display<SPI>,
+    buttons: &mut Buttons,
+    time_provider: &mut impl TimeProvider,
+) where
+    SPI: SpiDevice,
+{
+    info!("Forced initial render");
+    let mut state = MenuState::None;
+
+    loop {
+        display.render(&state, time_provider).unwrap();
+        let inactivity_timer = embassy_time::Timer::after(INACTIVITY_DURATION);
+        match select(inactivity_timer, buttons.wait_for_event_ready()).await {
+            Either::First(()) => {
+                info!(
+                    "Inactive for {}s, going to sleep.",
+                    INACTIVITY_DURATION.as_secs()
+                );
+                display.force_full_render(&state, time_provider).unwrap();
+                break;
+            }
+            Either::Second(()) => {
+                // If there are queued button interrupts (e.g. during a slow
+                // display update), process them all at once before refreshing the screen.
+                while let Some(e) = buttons.try_get_event() {
+                    info!("Button press: {}", e);
+                    match e {
+                        (ButtonId::Button1, ButtonEvent::Pressed) => {
+                            time_provider.shift_current_time(Duration::from_secs(60));
+                        }
+                        (ButtonId::Button2, ButtonEvent::Pressed) => {
+                            time_provider.shift_current_time(Duration::from_secs(60 * 60));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }

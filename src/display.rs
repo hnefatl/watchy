@@ -1,84 +1,53 @@
-use core::fmt::Write;
 use core::iter::{Cycle, Iterator};
 
-use defmt::{debug, info};
 use embassy_time::{Duration, Instant};
-use embedded_graphics::mono_font::iso_8859_1::FONT_10X20;
-use embedded_graphics::mono_font::{MonoFont, MonoTextStyle};
 use embedded_graphics::prelude::*;
-use embedded_graphics::text::Text;
 use embedded_hal::spi::SpiDevice;
 use epd_waveshare::epd1in54::Display1in54;
 use epd_waveshare::epd1in54_v2::Epd1in54;
 use epd_waveshare::prelude::*;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::peripherals::{GPIO34, GPIO35, GPIO36};
+use esp_hal::rtc_cntl::Rtc;
 
 const LUT_CYCLE: [Option<RefreshLut>; 4] =
     [Some(RefreshLut::Full), Some(RefreshLut::Quick), None, None];
 
-#[derive(Clone, Debug, PartialEq, Eq, defmt::Format)]
-pub enum WatchState {
-    Main,
-    ManualTimeSet { offset_hours: u64, offset_mins: u64 },
+pub trait TimeProvider {
+    fn get_current_time(&self) -> Instant;
+    fn set_current_time(&self, time: Instant);
+    fn shift_current_time(&self, shift: Duration);
 }
-
-#[derive(Clone, PartialEq, Eq, Debug, defmt::Format)]
-pub struct DisplayState {
-    pub watch_state: WatchState,
-    pub debug_status: heapless::String<100>,
-    pub time_since_boot: Instant,
-    pub time_offset: Duration,
+pub struct RtcTimeProvider<'a> {
+    rtc: &'a Rtc<'a>,
 }
-impl DisplayState {
-    fn render(&self, display: &mut Display1in54) {
-        const FONT: MonoFont = FONT_10X20;
-        const STYLE: MonoTextStyle<'_, Color> = MonoTextStyle::new(&FONT, Color::Black);
-
-        display.clear(Color::White);
-        let mut s = heapless::String::<20>::new();
-        let time = self.time_since_boot + self.time_offset;
-        let _ = write!(
-            s,
-            "{:02}:{:02}:{:02}",
-            time.as_secs() / 3600 % 24,
-            time.as_secs() / 60 % 60,
-            time.as_secs() % 60
-        );
-        let text = Text::new(&s, Point::new(40, 40), STYLE);
-        text.draw(display).unwrap();
-        info!("Time is now: {}", s);
-
-        let text = Text::new(&self.debug_status, Point::new(10, 70), STYLE);
-        text.draw(display).unwrap();
-
-        if let WatchState::ManualTimeSet {
-            offset_mins: _,
-            offset_hours: _,
-        } = self.watch_state
-        {
-            let text = Text::new("time set mode", Point::new(35, 100), STYLE);
-            text.draw(display).unwrap();
-        }
+impl<'a> RtcTimeProvider<'a> {
+    pub fn new(rtc: &'a Rtc<'a>) -> Self {
+        RtcTimeProvider { rtc }
     }
 }
-impl Default for DisplayState {
-    fn default() -> Self {
-        Self {
-            watch_state: WatchState::Main,
-            debug_status: heapless::String::new(),
-            time_since_boot: Instant::now(),
-            time_offset: Duration::from_secs(0),
-        }
+impl TimeProvider for RtcTimeProvider<'_> {
+    fn get_current_time(&self) -> Instant {
+        Instant::from_micros(self.rtc.current_time_us())
     }
+    fn set_current_time(&self, time: Instant) {
+        self.rtc.set_current_time_us(time.as_micros());
+    }
+    fn shift_current_time(&self, shift: Duration) {
+        self.set_current_time(self.get_current_time() + shift)
+    }
+}
+
+pub trait MenuItem {
+    fn render(&self, display: &mut Display1in54, time: &impl TimeProvider);
+    fn update(&mut self, time_provider: &impl TimeProvider);
 }
 
 pub struct Display<SPI> {
-    state: DisplayState,
-    lut_loop: Cycle<core::slice::Iter<'static, Option<RefreshLut>>>,
-    epd: Epd1in54<SPI, Input<'static>, Output<'static>, Output<'static>, embassy_time::Delay>,
     spi_device: SPI,
     display: Display1in54,
+    lut_loop: Cycle<core::slice::Iter<'static, Option<RefreshLut>>>,
+    epd: Epd1in54<SPI, Input<'static>, Output<'static>, Output<'static>, embassy_time::Delay>,
 }
 
 impl<SPI> Display<SPI>
@@ -104,30 +73,20 @@ where
 
         epd.set_background_color(Color::White);
         Self {
-            state: DisplayState::default(),
-            lut_loop: LUT_CYCLE.iter().cycle(),
-            epd,
             spi_device,
             display,
+            lut_loop: LUT_CYCLE.iter().cycle(),
+            epd,
         }
     }
 
-    pub fn update_state<F>(&mut self, update_state: F) -> Result<(), SPI::Error>
-    where
-        F: FnOnce(&mut DisplayState),
-    {
-        let old_state = self.state.clone();
-        update_state(&mut self.state);
-        if self.state != old_state {
-            debug!("New state: {}", self.state);
-            self.force_render()
-        } else {
-            Ok(())
-        }
-    }
-    pub fn force_render(&mut self) -> Result<(), SPI::Error> {
+    pub fn render<M: MenuItem>(
+        &mut self,
+        renderable: &M,
+        time_provider: &impl TimeProvider,
+    ) -> Result<(), SPI::Error> {
         self.display.clear(Color::White);
-        self.state.render(&mut self.display);
+        renderable.render(&mut self.display, time_provider);
 
         self.epd
             .wake_up(&mut self.spi_device, &mut embassy_time::Delay)?;
@@ -145,5 +104,13 @@ where
         self.epd
             .sleep(&mut self.spi_device, &mut embassy_time::Delay)?;
         Ok(())
+    }
+    pub fn force_full_render<M: MenuItem>(
+        &mut self,
+        renderable: &M,
+        time_provider: &impl TimeProvider,
+    ) -> Result<(), SPI::Error> {
+        self.lut_loop = LUT_CYCLE.iter().cycle();
+        self.render(renderable, time_provider)
     }
 }
