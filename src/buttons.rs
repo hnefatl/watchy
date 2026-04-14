@@ -18,7 +18,7 @@ pub type ButtonPins = (
 
 /// Button events. Lives for whole program duration: cleared upon creating a `Buttons` object and
 /// can't be accessed after that object is reclaimed.
-static CHANNEL: Channel<CriticalSectionRawMutex, (ButtonId, ButtonEvent), 100> = Channel::new();
+static CHANNEL: Channel<CriticalSectionRawMutex, ButtonChange, 100> = Channel::new();
 #[derive(Debug, defmt::Format, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonId {
     Button1,
@@ -31,6 +31,7 @@ pub enum ButtonEvent {
     Pressed,
     Released,
 }
+pub type ButtonChange = (ButtonId, ButtonEvent);
 
 /// Button states, stored globally so that they can be accessed from the interrupt handler.
 static BUTTONS: Mutex<RefCell<Option<SharedButtons>>> = Mutex::new(RefCell::new(None));
@@ -85,7 +86,7 @@ impl Buttons {
     }
 
     /// Wait and receive the first event.
-    pub async fn wait_for_event(&mut self) -> (ButtonId, ButtonEvent) {
+    pub async fn wait_for_event(&mut self) -> ButtonChange {
         CHANNEL.receive().await
     }
     /// Wait for an event to be ready, but don't return it.
@@ -93,11 +94,25 @@ impl Buttons {
         CHANNEL.ready_to_receive().await
     }
     /// Fetch an event if one exists.
-    pub fn try_get_event(&mut self) -> Option<(ButtonId, ButtonEvent)> {
+    pub fn try_get_event(&mut self) -> Option<ButtonChange> {
         match CHANNEL.try_receive() {
             Ok(b) => Some(b),
             Err(TryReceiveError::Empty) => None,
         }
+    }
+    pub fn is_pressed(&self, button_id: ButtonId) -> bool {
+        critical_section::with(|cs| {
+            let b = BUTTONS.borrow_ref(cs);
+            let Some(buttons) = b.as_ref() else {
+                panic!("`reclaim` called before `init` was called");
+            };
+            match button_id {
+                ButtonId::Button1 => buttons.button1.pressed,
+                ButtonId::Button2 => buttons.button2.pressed,
+                ButtonId::Button3 => buttons.button3.pressed,
+                ButtonId::Button4 => buttons.button4.pressed,
+            }
+        })
     }
     pub fn get_states(&self) -> (bool, bool, bool, bool) {
         critical_section::with(|cs| {

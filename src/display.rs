@@ -1,6 +1,5 @@
 use core::iter::{Cycle, Iterator};
 
-use embassy_time::{Duration, Instant};
 use embedded_graphics::prelude::*;
 use embedded_hal::spi::SpiDevice;
 use epd_waveshare::epd1in54::Display1in54;
@@ -8,40 +7,11 @@ use epd_waveshare::epd1in54_v2::Epd1in54;
 use epd_waveshare::prelude::*;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::peripherals::{GPIO34, GPIO35, GPIO36};
-use esp_hal::rtc_cntl::Rtc;
+
+use crate::menu::*;
 
 const LUT_CYCLE: [Option<RefreshLut>; 4] =
     [Some(RefreshLut::Full), Some(RefreshLut::Quick), None, None];
-
-pub trait TimeProvider {
-    fn get_current_time(&self) -> Instant;
-    fn set_current_time(&self, time: Instant);
-    fn shift_current_time(&self, shift: Duration);
-}
-pub struct RtcTimeProvider<'a> {
-    rtc: &'a Rtc<'a>,
-}
-impl<'a> RtcTimeProvider<'a> {
-    pub fn new(rtc: &'a Rtc<'a>) -> Self {
-        RtcTimeProvider { rtc }
-    }
-}
-impl TimeProvider for RtcTimeProvider<'_> {
-    fn get_current_time(&self) -> Instant {
-        Instant::from_micros(self.rtc.current_time_us())
-    }
-    fn set_current_time(&self, time: Instant) {
-        self.rtc.set_current_time_us(time.as_micros());
-    }
-    fn shift_current_time(&self, shift: Duration) {
-        self.set_current_time(self.get_current_time() + shift)
-    }
-}
-
-pub trait MenuItem {
-    fn render(&self, display: &mut Display1in54, time: &impl TimeProvider);
-    fn update(&mut self, time_provider: &impl TimeProvider);
-}
 
 pub struct Display<SPI> {
     spi_device: SPI,
@@ -80,17 +50,19 @@ where
         }
     }
 
+    /// Renders the menu, and returns the type of refresh done.
     pub fn render<M: MenuItem>(
         &mut self,
         renderable: &M,
-        time_provider: &impl TimeProvider,
-    ) -> Result<(), SPI::Error> {
+        time_provider: &RtcTimeProvider<'_>,
+    ) -> Result<RefreshLut, SPI::Error> {
         self.display.clear(Color::White);
         renderable.render(&mut self.display, time_provider);
 
         self.epd
             .wake_up(&mut self.spi_device, &mut embassy_time::Delay)?;
-        if let Some(lut) = self.lut_loop.next().unwrap() {
+        let current_lut = self.lut_loop.next().unwrap();
+        if let Some(lut) = current_lut {
             self.epd
                 .set_lut(&mut self.spi_device, &mut embassy_time::Delay, Some(*lut))?;
         }
@@ -103,13 +75,13 @@ where
             .wait_until_idle(&mut self.spi_device, &mut embassy_time::Delay)?;
         self.epd
             .sleep(&mut self.spi_device, &mut embassy_time::Delay)?;
-        Ok(())
+        Ok(current_lut.unwrap_or(RefreshLut::Quick))
     }
     pub fn force_full_render<M: MenuItem>(
         &mut self,
         renderable: &M,
-        time_provider: &impl TimeProvider,
-    ) -> Result<(), SPI::Error> {
+        time_provider: &RtcTimeProvider<'_>,
+    ) -> Result<RefreshLut, SPI::Error> {
         self.lut_loop = LUT_CYCLE.iter().cycle();
         self.render(renderable, time_provider)
     }

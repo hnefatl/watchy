@@ -8,17 +8,11 @@
 #![deny(clippy::large_stack_frames)]
 
 use core::cell::RefCell;
-use core::fmt::Write;
 
 use embassy_futures::select::{Either, select};
-use embedded_graphics::mono_font::ascii::FONT_10X20;
-use embedded_graphics::mono_font::{MonoFont, MonoTextStyle};
-use embedded_graphics::prelude::*;
-use embedded_graphics::text::Text;
 use embedded_hal::spi::SpiDevice;
 use embedded_hal_bus::spi::RefCellDevice;
-use epd_waveshare::color::Color;
-use epd_waveshare::epd1in54::Display1in54;
+use epd_waveshare::prelude::RefreshLut;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Io, Level, OutputConfig, RtcFunction, RtcPin};
 use esp_hal::rtc_cntl::sleep::{RtcioWakeupSource, TimerWakeupSource, WakeupLevel};
@@ -45,55 +39,10 @@ mod display;
 use display::*;
 mod buttons;
 use buttons::*;
+mod menu;
+use menu::*;
 
 const INACTIVITY_DURATION: Duration = Duration::from_secs(5);
-
-// TODO: split into separate structs for clarity.
-#[derive(Clone, Debug, PartialEq, Eq, defmt::Format)]
-pub enum MenuState {
-    None,
-    DebugView(heapless::String<100>),
-    ManualTimeSet { offset_hours: u64, offset_mins: u64 },
-}
-// TODO: add update for each struct.
-impl MenuItem for MenuState {
-    fn render(&self, display: &mut Display1in54, time_provider: &impl TimeProvider) {
-        const FONT: MonoFont = FONT_10X20;
-        const STYLE: MonoTextStyle<'_, Color> = MonoTextStyle::new(&FONT, Color::Black);
-
-        display.clear(Color::White);
-
-        let current_time = time_provider.get_current_time();
-        match &self {
-            MenuState::None => {
-                let mut s = heapless::String::<20>::new();
-                let _ = write!(
-                    s,
-                    "{:02}:{:02}:{:02}",
-                    current_time.as_secs() / 3600 % 24,
-                    current_time.as_secs() / 60 % 60,
-                    current_time.as_secs() % 60
-                );
-                let text = Text::new(&s, Point::new(40, 40), STYLE);
-                text.draw(display).unwrap();
-            }
-            MenuState::DebugView(message) => {
-                let text = Text::new(&message, Point::new(10, 10), STYLE);
-                text.draw(display).unwrap();
-            }
-            MenuState::ManualTimeSet {
-                offset_hours: _,
-                offset_mins: _,
-            } => {
-                let text = Text::new("time set mode", Point::new(35, 100), STYLE);
-                text.draw(display).unwrap();
-            }
-        }
-    }
-    fn update(&mut self, time_provider: &impl TimeProvider) {
-        unimplemented!()
-    }
-}
 
 #[allow(
     clippy::large_stack_frames,
@@ -191,15 +140,15 @@ async fn main(_spawner: Spawner) -> ! {
 async fn main_loop<SPI>(
     display: &mut Display<SPI>,
     buttons: &mut Buttons,
-    time_provider: &mut impl TimeProvider,
+    time_provider: &RtcTimeProvider<'_>,
 ) where
     SPI: SpiDevice,
 {
-    info!("Forced initial render");
-    let mut state = MenuState::None;
+    let mut state = OneOfMenu::MenuMain(MenuMain);
 
+    let mut last_refresh_type;
     loop {
-        display.render(&state, time_provider).unwrap();
+        last_refresh_type = display.render(&state, time_provider).unwrap();
         let inactivity_timer = embassy_time::Timer::after(INACTIVITY_DURATION);
         match select(inactivity_timer, buttons.wait_for_event_ready()).await {
             Either::First(()) => {
@@ -207,7 +156,9 @@ async fn main_loop<SPI>(
                     "Inactive for {}s, going to sleep.",
                     INACTIVITY_DURATION.as_secs()
                 );
-                display.force_full_render(&state, time_provider).unwrap();
+                if last_refresh_type != RefreshLut::Full {
+                    display.force_full_render(&state, time_provider).unwrap();
+                }
                 break;
             }
             Either::Second(()) => {
@@ -215,18 +166,9 @@ async fn main_loop<SPI>(
                 // display update), process them all at once before refreshing the screen.
                 while let Some(e) = buttons.try_get_event() {
                     info!("Button press: {}", e);
-                    match e {
-                        (ButtonId::Button1, ButtonEvent::Pressed) => {
-                            time_provider.shift_current_time(Duration::from_secs(60));
-                        }
-                        (ButtonId::Button2, ButtonEvent::Pressed) => {
-                            time_provider.shift_current_time(Duration::from_secs(60 * 60));
-                        }
-                        _ => {}
-                    }
+                    state = state.update(time_provider, e, &buttons);
                 }
             }
-            _ => {}
         }
     }
 }
